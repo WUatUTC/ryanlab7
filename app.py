@@ -1,8 +1,5 @@
 import streamlit as st
 import pandas as pd
-import requests
-import zipfile
-import io
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -14,51 +11,31 @@ from sklearn.metrics import mean_absolute_error, r2_score
 # --- Page Configuration ---
 st.set_page_config(page_title="Hamilton County Properties Predictor", layout="centered")
 
-# --- 1. Load and Clean Data via ZIP URL ---
+# --- 1. Load and Clean Data ---
 @st.cache_data(show_spinner=False)
 def load_data():
-    # 👉 PASTE YOUR URL TO THE .ZIP FILE HERE 👈
-    data_url = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip"
-    
     try:
-        # Download the ZIP file from the URL
-        response = requests.get(data_url, timeout=120)
-        response.raise_for_status()
+        # Since the file is in your GitHub repo, Streamlit reads it directly!
+        df = pd.read_csv("Housing_Hamilton_Compressed.csv.gz", compression="gzip")
+    except FileNotFoundError:
+        st.error("Dataset not found! Please make sure 'Housing_Hamilton_Compressed.csv.gz' is uploaded to your GitHub repository.")
+        st.stop()
         
-        # Extract the CSV from the ZIP in memory
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-            # Find the first CSV file in the zip archive
-            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
-            
-            if not csv_files:
-                st.error("No CSV file found inside the downloaded ZIP.")
-                st.stop()
-            
-            target_csv = csv_files[0] 
-            with z.open(target_csv) as f:
-                df = pd.read_csv(f, low_memory=False)
-                
-    except Exception as e:
-        st.error(f"Failed to load or unzip dataset from URL. Error: {e}")
-        st.stop()
+    # Apply lab cleaning steps
+    # Drop rows with missing APPRAISED_VALUE [cite: 11]
+    df_model = df.dropna(subset=["APPRAISED_VALUE"]) 
     
-    # Standardize column names
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    # Remove clearly invalid values (e.g., APPRAISED_VALUE <= 0) [cite: 11]
+    df_model = df_model[df_model["APPRAISED_VALUE"] > 0] 
     
-    if "APPRAISED_VALUE" not in df.columns:
-        st.error(f"The extracted file ({target_csv}) does not contain the target variable 'APPRAISED_VALUE'.")
-        st.stop()
-
-    # Clean target variable [cite: 11]
-    df["APPRAISED_VALUE"] = pd.to_numeric(
-        df["APPRAISED_VALUE"].astype(str).str.replace(r'[$,]', '', regex=True), errors="coerce"
-    )
-    df_model = df.dropna(subset=["APPRAISED_VALUE"])
-    df_model = df_model[df_model["APPRAISED_VALUE"] > 0]
-    
-    # Filter to residential parcels if the column exists [cite: 11]
+    # Filter to residential parcels [cite: 11]
     if "LAND_USE_CODE_DESC" in df_model.columns:
         df_model = df_model[df_model["LAND_USE_CODE_DESC"].astype(str).str.contains("One Family", na=False)]
+        
+    # Safety net: Ensure the dataset isn't empty after cleaning
+    if len(df_model) == 0:
+        st.error("Error: The dataset has 0 rows after cleaning! Please check your data source.")
+        st.stop()
         
     return df_model
 
@@ -67,16 +44,14 @@ def load_data():
 def train_model(df_model):
     target = "APPRAISED_VALUE"
     
-    # Recommended features from the lab [cite: 12]
-    expected_num = ["LAND_VALUE", "BUILD_VALUE", "YARDITEMS_VALUE", "CALC_ACRES"]
-    expected_cat = ["ZONING_DESC", "NEIGHBORHOOD_CODE_DESC", "LAND_USE_CODE_DESC", "PROPERTY_TYPE_CODE_DESC"]
+    # Recommended starter predictors [cite: 12]
+    num_features = ["LAND_VALUE", "BUILD_VALUE", "YARDITEMS_VALUE", "CALC_ACRES"]
+    cat_features = ["ZONING_DESC", "NEIGHBORHOOD_CODE_DESC", "LAND_USE_CODE_DESC", "PROPERTY_TYPE_CODE_DESC"]
 
-    # Only use features that actually exist in the downloaded CSV
-    num_features = [f for f in expected_num if f in df_model.columns]
-    cat_features = [f for f in expected_cat if f in df_model.columns]
-
-    if not num_features and not cat_features:
-        st.error("None of the required predictor features were found in the dataset! Check your data source.")
+    # Ensure all required columns exist
+    missing_cols = [col for col in num_features + cat_features if col not in df_model.columns]
+    if missing_cols:
+        st.error(f"Missing columns in dataset: {missing_cols}")
         st.stop()
 
     X = df_model[num_features + cat_features]
@@ -84,13 +59,14 @@ def train_model(df_model):
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # Preprocessing pipelines [cite: 12]
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
     ])
 
     categorical_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")), # [cite: 13]
     ])
 
     preprocess = ColumnTransformer(
@@ -100,6 +76,7 @@ def train_model(df_model):
         ]
     )
 
+    # Model training [cite: 14]
     model = Pipeline(steps=[
         ("preprocess", preprocess),
         ("regressor", LinearRegression())
@@ -116,9 +93,9 @@ def train_model(df_model):
 # --- Main App Execution ---
 
 st.title("Hamilton County Properties Predictor")
-st.write("Enter the property characteristics below to predict the appraised value using a machine learning model.")
+st.write("Enter the property characteristics below to predict the appraised value.")
 
-with st.spinner("Downloading ZIP file and training model..."):
+with st.spinner("Loading compressed data and training model..."):
     df_model = load_data()
     model, mae, r2, df_model, num_features, cat_features = train_model(df_model)
 
@@ -126,14 +103,16 @@ with st.spinner("Downloading ZIP file and training model..."):
 st.sidebar.header("Property Characteristics")
 user_inputs = {}
 
-# Dynamically generate inputs based on available numerical features
+# Minimum app requirements: inputs for LAND_VALUE, BUILD_VALUE, YARDITEMS_VALUE, CALC_ACRES [cite: 15]
 for feature in num_features:
-    user_inputs[feature] = st.sidebar.number_input(f"{feature} (Numerical)", min_value=0.0, value=0.0, step=100.0)
+    # Set some sensible defaults based on typical values
+    default_val = float(df_model[feature].median())
+    user_inputs[feature] = st.sidebar.number_input(f"{feature}", min_value=0.0, value=default_val, step=100.0)
 
-# Dynamically generate dropdowns based on available categorical features
+# Minimum app requirements: at least one categorical selector [cite: 15]
 for feature in cat_features:
     options = df_model[feature].dropna().unique().tolist()
-    user_inputs[feature] = st.sidebar.selectbox(f"{feature} (Categorical)", options=options)
+    user_inputs[feature] = st.sidebar.selectbox(f"{feature}", options=options)
 
 # --- 4. Prediction ---
 input_df = pd.DataFrame([user_inputs])
@@ -142,11 +121,14 @@ if st.sidebar.button("Predict Appraised Value"):
     prediction = model.predict(input_df)[0]
     
     st.subheader("Results")
+    # Output: predicted appraised value [cite: 15, 16]
     st.metric(label="Predicted Appraised Value", value=f"${prediction:,.2f}") 
     
     st.divider()
     st.write("### Model Performance Metrics")
-    st.write(f"- **Mean Absolute Error (MAE):** ${mae:,.2f}") # Output requested by rubric [cite: 14]
-    st.write(f"- **R² Score:** {r2:.3f}") # Output requested by rubric [cite: 14]
+    # Report both MAE and R² [cite: 15]
+    st.write(f"- **Mean Absolute Error (MAE):** ${mae:,.2f}") 
+    st.write(f"- **R² Score:** {r2:.3f}") 
 
-st.caption("This is for educational demonstration only.") # Mandatory disclaimer [cite: 16]
+# Output: a brief disclaimer: “This is for educational demonstration only.” [cite: 16]
+st.caption("This is for educational demonstration only.")
