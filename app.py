@@ -1,412 +1,133 @@
-import io
-import zipfile
-
-import pandas as pd
-import requests
 import streamlit as st
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
 
-# --------------------------------------------------
-# Page setup
-# --------------------------------------------------
-st.set_page_config(page_title="Hamilton County Home Value Predictor", layout="wide")
+# --- Page Config ---
+st.set_page_config(page_title="Hamilton County Properties Predictor", layout="centered")
 
-DATA_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip"
-
-
-# --------------------------------------------------
-# Data loading
-# --------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_data() -> pd.DataFrame:
-    """Download and read the Hamilton County assessor CSV from the ZIP file."""
-    response = requests.get(DATA_URL, timeout=120)
-    response.raise_for_status()
-
-    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-        csv_files = [name for name in zf.namelist() if name.lower().endswith(".csv")]
-        if not csv_files:
-            raise FileNotFoundError("No CSV file found inside the downloaded ZIP archive.")
-
-        with zf.open(csv_files[0]) as f:
-            df = pd.read_csv(f, low_memory=False)
-
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    return df
-
-
-# --------------------------------------------------
-# Cleaning helpers
-# --------------------------------------------------
-def try_numeric(series: pd.Series) -> pd.Series:
-    """
-    Convert a column to numeric as safely as possible.
-    Handles commas, dollar signs, spaces, and mixed text.
-    """
-    cleaned = (
-        series.astype(str)
-        .str.strip()
-        .str.replace(",", "", regex=False)
-        .str.replace("$", "", regex=False)
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
-
-
-def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean the target column and keep only rows with plausible appraised values."""
-    df = df.copy()
-
-    if "APPRAISED_VALUE" not in df.columns:
-        raise KeyError("APPRAISED_VALUE column was not found in the dataset.")
-
-    df["APPRAISED_VALUE"] = try_numeric(df["APPRAISED_VALUE"])
-    df = df[df["APPRAISED_VALUE"].notna()]
-    df = df[df["APPRAISED_VALUE"] > 1000].copy()
-
-    if len(df) == 0:
-        raise ValueError("No usable rows remain after cleaning APPRAISED_VALUE.")
-
-    return df
-
-
-def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Try to keep residential-like parcels if code/description columns exist.
-    Falls back to the full dataset if filtering becomes too small.
-    """
-    df = df.copy()
-
-    # Prefer code-based filtering when available
-    if "PROP_TYPE_CODE" in df.columns:
-        prop_code = try_numeric(df["PROP_TYPE_CODE"])
-        mask = prop_code.isin([22, 32, 40])
-        if mask.sum() >= 1000:
-            return df[mask].copy()
-
-    if "LAND_USE_CODE" in df.columns:
-        land_use = try_numeric(df["LAND_USE_CODE"])
-        mask = ((land_use >= 100) & (land_use < 200)) | land_use.isin(
-            [111, 112, 113, 114, 115, 116, 117]
-        )
-        if mask.sum() >= 1000:
-            return df[mask].copy()
-
-    # Fallback to description columns
-    desc_cols = ["PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC"]
-    pattern = (
-        r"RESIDENTIAL|RENTAL|APARTMENT|CONDOMINIUM|CONDO|DUPLEX|TRIPLEX|"
-        r"ONE FAMILY|HOUSEHOLD UNIT|MOBILE HOME"
-    )
-
-    for col in desc_cols:
-        if col in df.columns:
-            mask = df[col].astype(str).str.upper().str.contains(pattern, na=False, regex=True)
-            if mask.sum() >= 1000:
-                return df[mask].copy()
-
-    return df
-
-
-# --------------------------------------------------
-# Feature detection
-# --------------------------------------------------
-def detect_features(df: pd.DataFrame) -> list[str]:
-    """
-    Automatically detect usable numeric feature columns.
-    Rules are intentionally relaxed because assessor exports often store
-    numbers as text with commas/spaces.
-    """
-    exclude_cols = {
-        "APPRAISED_VALUE",
-        "MAP",
-        "GROUP",
-        "PARCEL",
-        "OWNER_NAME",
-        "OWNER_ADDRESS",
-        "PROPERTY_ADDRESS",
-        "CITY",
-        "STATE",
-        "ZIP",
-    }
-
-    usable = []
-
-    for col in df.columns:
-        if col in exclude_cols:
-            continue
-
-        numeric = try_numeric(df[col])
-        non_missing = int(numeric.notna().sum())
-        unique_vals = int(numeric.nunique(dropna=True))
-
-        # Relaxed thresholds so real numeric admin fields survive detection
-        if non_missing > 500 and unique_vals > 3:
-            usable.append(col)
-
-    return usable
-
-
-def choose_default_features(features: list[str], max_features: int = 6) -> list[str]:
-    """
-    Prefer housing-related columns first if they exist, then fill from the rest.
-    """
-    preferred_order = [
-        "CALC_ACRES",
-        "LAND_SQUARE_FOOTAGE",
-        "TOTAL_ROOMS",
-        "BEDROOMS",
-        "YEAR_BUILT",
-        "STORIES",
-        "BATHS",
-        "FULL_BATHS",
-        "HALF_BATHS",
-        "LIVING_AREA",
-        "HEATED_AREA",
-        "BUILDING_SQUARE_FEET",
-        "GRADE",
-        "CONDITION",
+# --- 1. Load and Clean Data ---
+@st.cache_data
+def load_data():
+    # We use usecols to only load the features we actually need, saving massive amounts of memory.
+    # If you compressed the file to CSV, change this to pd.read_csv("cleaned_housing_data.csv")
+    use_cols = [
+        "APPRAISED_VALUE", "LAND_VALUE", "BUILD_VALUE", "YARDITEMS_VALUE", "CALC_ACRES",
+        "ZONING_DESC", "NEIGHBORHOOD_CODE_DESC", "LAND_USE_CODE_DESC", "PROPERTY_TYPE_CODE_DESC"
     ]
+    df = pd.read_excel("Housing_Hamilton_County.xlsx", engine="openpyxl", usecols=use_cols)
+    
+    # Cleaning steps required by the lab
+    df_model = df.dropna(subset=["APPRAISED_VALUE"])
+    df_model = df_model[df_model["APPRAISED_VALUE"] > 0]
+    
+    # Filter to residential parcels
+    df_model = df_model[df_model["LAND_USE_CODE_DESC"].astype(str).str.contains("One Family", na=False)]
+    
+    return df_model
 
-    selected = [c for c in preferred_order if c in features]
+# --- 2. Train Model ---
+@st.cache_resource
+def train_model(df_model):
+    target = "APPRAISED_VALUE"
+    num_features = ["LAND_VALUE", "BUILD_VALUE", "YARDITEMS_VALUE", "CALC_ACRES"]
+    cat_features = ["ZONING_DESC", "NEIGHBORHOOD_CODE_DESC", "LAND_USE_CODE_DESC", "PROPERTY_TYPE_CODE_DESC"]
 
-    for col in features:
-        if col not in selected:
-            selected.append(col)
+    X = df_model[num_features + cat_features]
+    y = df_model[target]
 
-    return selected[:max_features]
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # Preprocessing pipelines
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
 
-# --------------------------------------------------
-# Model prep
-# --------------------------------------------------
-def build_xy(df: pd.DataFrame, selected_features: list[str]):
-    """Create feature matrix X and target y."""
-    if not selected_features:
-        raise ValueError("No feature columns were selected.")
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
 
-    X = pd.DataFrame(index=df.index)
-
-    for col in selected_features:
-        X[col] = try_numeric(df[col])
-
-    y = df["APPRAISED_VALUE"].copy()
-
-    # Basic sanity cleaning for year-like columns
-    for col in X.columns:
-        if "YEAR" in col:
-            X.loc[(X[col] < 1800) | (X[col] > 2100), col] = pd.NA
-
-    # Drop columns that remain weak after cleaning
-    usable_cols = [
-        col for col in X.columns
-        if X[col].notna().sum() > 500 and X[col].nunique(dropna=True) > 3
-    ]
-    X = X[usable_cols].copy()
-
-    if X.empty:
-        raise ValueError("No usable predictor columns remain after cleaning.")
-
-    feature_defaults = X.median(numeric_only=True).to_dict()
-    X = X.fillna(pd.Series(feature_defaults))
-    X = X.replace([float("inf"), float("-inf")], pd.NA)
-    X = X.fillna(pd.Series(feature_defaults))
-
-    X, y = X.align(y, join="inner", axis=0)
-
-    if len(X) < 1000:
-        raise ValueError(f"Not enough usable rows for training: {len(X)}")
-
-    return X.astype(float), y.astype(float), list(X.columns), feature_defaults
-
-
-def train_model(X: pd.DataFrame, y: pd.Series):
-    """Train a linear regression model and compute simple evaluation metrics."""
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, num_features),
+            ("cat", categorical_transformer, cat_features),
+        ]
     )
 
-    model = LinearRegression()
+    # Combine preprocessing and model into a single pipeline
+    model = Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("regressor", LinearRegression())
+    ])
+
+    # Train the model
     model.fit(X_train, y_train)
+    
+    # Evaluate 
+    preds = model.predict(X_test)
+    mae = mean_absolute_error(y_test, preds)
+    r2 = r2_score(y_test, preds)
+    
+    return model, mae, r2, df_model
 
-    predictions = model.predict(X_test)
-    mae = mean_absolute_error(y_test, predictions)
-    r2 = r2_score(y_test, predictions)
+# --- Main App Execution ---
 
-    return model, mae, r2
-
-
-# --------------------------------------------------
-# App UI
-# --------------------------------------------------
-st.title("Hamilton County Home Value Predictor")
-st.write("Enter property features to estimate appraised value.")
-
-show_debug = st.sidebar.checkbox("Show debug info", value=True)
-use_residential = st.sidebar.checkbox("Use residential filter", value=True)
-
-# Load and clean data first
-try:
-    with st.spinner("Loading assessor data..."):
-        df = load_data()
-        df = clean_dataset(df)
-
-        if use_residential:
-            df_res = residential_filter(df)
-            if len(df_res) >= 1000:
-                df = df_res
-except Exception as e:
-    st.error(f"Data loading failed: {e}")
-    st.stop()
-
-# Detect features before training
-detected_features = detect_features(df)
-default_features = choose_default_features(detected_features, max_features=6)
-
-if show_debug:
-    with st.expander("Available columns", expanded=False):
-        st.write(df.columns.tolist())
-
-    with st.expander("Detected numeric features", expanded=True):
-        st.write(detected_features)
-
-    with st.expander("Preview of key data", expanded=False):
-        preview_cols = ["APPRAISED_VALUE"] + default_features[:6]
-        preview_cols = [c for c in preview_cols if c in df.columns]
-        if preview_cols:
-            st.dataframe(df[preview_cols].head(10))
-        else:
-            st.write("No preview columns available.")
-
-# Sidebar feature selection
-st.sidebar.header("Model Features")
-selected_features = st.sidebar.multiselect(
-    "Choose features for the model",
-    options=detected_features,
-    default=default_features,
-)
-
-if not selected_features:
-    st.warning("Please select at least one feature.")
-    st.stop()
-
-# Build and train
-try:
-    with st.spinner("Training model..."):
-        X, y, feature_names, feature_defaults = build_xy(df, selected_features)
-        model, mae, r2 = train_model(X, y)
-except Exception as e:
-    st.error(f"Model setup failed: {e}")
-    st.stop()
-
-# Sidebar user inputs
-st.sidebar.header("Property Inputs")
-
-label_map = {
-    "CALC_ACRES": "Lot Size (acres)",
-    "LAND_SQUARE_FOOTAGE": "Land Area (sq ft)",
-    "TOTAL_ROOMS": "Total Rooms",
-    "BEDROOMS": "Bedrooms",
-    "YEAR_BUILT": "Year Built",
-    "STORIES": "Stories",
-    "BATHS": "Bathrooms",
-    "FULL_BATHS": "Full Bathrooms",
-    "HALF_BATHS": "Half Bathrooms",
-    "LIVING_AREA": "Living Area (sq ft)",
-    "HEATED_AREA": "Heated Area (sq ft)",
-    "BUILDING_SQUARE_FEET": "Building Area (sq ft)",
-    "GRADE": "Grade",
-    "CONDITION": "Condition",
-}
-
-user_input = {}
-for col in feature_names:
-    default_val = feature_defaults.get(col, 0.0)
-    if pd.isna(default_val):
-        default_val = 0.0
-
-    label = label_map.get(col, col)
-
-    integer_like = (
-        ("YEAR" in col)
-        or ("ROOM" in col)
-        or ("BED" in col)
-        or ("BATH" in col)
-        or ("STORY" in col)
-        or ("GRADE" in col)
-        or ("CONDITION" in col)
-    )
-
-    if integer_like:
-        user_input[col] = st.sidebar.number_input(
-            label,
-            min_value=0,
-            value=int(round(float(default_val))),
-            step=1,
-        )
-    else:
-        user_input[col] = st.sidebar.number_input(
-            label,
-            min_value=0.0,
-            value=float(default_val),
-            step=0.1,
-        )
-
-# Prediction row
-X_user = pd.DataFrame([user_input], columns=feature_names)
-
-for col in X_user.columns:
-    X_user[col] = pd.to_numeric(X_user[col], errors="coerce")
-
-X_user = X_user.replace([float("inf"), float("-inf")], pd.NA)
-X_user = X_user.fillna(pd.Series(feature_defaults))
-X_user = X_user.astype(float)
+st.title("Hamilton County Properties Predictor")
+st.write("Enter the property characteristics below to predict the appraised value using a machine learning model.")
 
 try:
-    prediction = float(model.predict(X_user)[0])
-except Exception as e:
-    st.error(f"Prediction failed: {e}")
+    with st.spinner("Loading data and training model..."):
+        df_model = load_data()
+        model, mae, r2, df_model = train_model(df_model)
+except FileNotFoundError:
+    st.error("Dataset not found! Please ensure 'Housing_Hamilton_County.xlsx' is in the same directory as this script.")
     st.stop()
 
-# --------------------------------------------------
-# Main display
-# --------------------------------------------------
-st.subheader("Estimated Appraised Value")
-st.metric("Predicted Value", f"${prediction:,.0f}")
+# --- 3. User Inputs (Sidebar) ---
+st.sidebar.header("Property Characteristics")
 
-col1, col2 = st.columns(2)
+# Numerical inputs
+land_value = st.sidebar.number_input("Land Value ($)", min_value=0, value=50000, step=1000)
+build_value = st.sidebar.number_input("Build Value ($)", min_value=0, value=150000, step=1000)
+yarditems_value = st.sidebar.number_input("Yard Items Value ($)", min_value=0, value=0, step=500)
+calc_acres = st.sidebar.number_input("Calculated Acres", min_value=0.0, value=0.25, step=0.1)
 
-with col1:
-    st.markdown("### Inputs Used")
-    for col in feature_names:
-        st.write(f"**{label_map.get(col, col)}:** {user_input[col]}")
+# Categorical inputs (dynamically pulling options from the dataset)
+zoning_desc = st.sidebar.selectbox("Zoning Description", options=df_model["ZONING_DESC"].dropna().unique())
+neighborhood = st.sidebar.selectbox("Neighborhood Code", options=df_model["NEIGHBORHOOD_CODE_DESC"].dropna().unique())
+land_use = st.sidebar.selectbox("Land Use", options=df_model["LAND_USE_CODE_DESC"].dropna().unique())
+prop_type = st.sidebar.selectbox("Property Type", options=df_model["PROPERTY_TYPE_CODE_DESC"].dropna().unique())
 
-with col2:
-    st.markdown("### Model Information")
-    st.write(f"**Features used:** {', '.join(label_map.get(c, c) for c in feature_names)}")
-    st.write(f"**Mean Absolute Error:** ${mae:,.0f}")
-    st.write(f"**R²:** {r2:.3f}")
+# --- 4. Prediction ---
+# Create a dataframe for the user's input
+input_data = pd.DataFrame({
+    "LAND_VALUE": [land_value],
+    "BUILD_VALUE": [build_value],
+    "YARDITEMS_VALUE": [yarditems_value],
+    "CALC_ACRES": [calc_acres],
+    "ZONING_DESC": [zoning_desc],
+    "NEIGHBORHOOD_CODE_DESC": [neighborhood],
+    "LAND_USE_CODE_DESC": [land_use],
+    "PROPERTY_TYPE_CODE_DESC": [prop_type]
+})
 
-st.caption(
-    "This app is for educational demonstration only. Predictions are based on a simple linear regression model trained on public assessor data."
-)
-
-# --------------------------------------------------
-# Optional debug section
-# --------------------------------------------------
-if show_debug:
+if st.sidebar.button("Predict Appraised Value"):
+    prediction = model.predict(input_data)[0]
+    
+    st.subheader("Results")
+    st.metric(label="Predicted Appraised Value", value=f"${prediction:,.2f}")
+    
     st.divider()
-    st.subheader("Debug Information")
+    st.write("### Model Performance Metrics")
+    st.write(f"- **Mean Absolute Error (MAE):** ${mae:,.2f}")
+    st.write(f"- **R² Score:** {r2:.3f}")
 
-    with st.expander("Non-missing counts for selected features", expanded=False):
-        st.write(df[feature_names].apply(lambda s: try_numeric(s).notna().sum()))
-
-    with st.expander("Cleaned feature matrix preview", expanded=False):
-        st.dataframe(X.head(10))
-
-    with st.expander("Target summary", expanded=False):
-        st.write(y.describe())
-
-    with st.expander("Prediction row sent to model", expanded=False):
-        st.dataframe(X_user)
+# Educational disclaimer required by lab
+st.caption("This is for educational demonstration only.")
