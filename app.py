@@ -58,28 +58,33 @@ def unzip_all(zip_path: str, extract_dir: str = "data_assessor") -> list[str]:
 def load_df(zip_path: str | None, csv_path: str | None) -> pd.DataFrame:
     if zip_path:
         extracted_files = unzip_all(zip_path)
-        # Find main parcel file (largest or by name)
-        main_file = max(extracted_files, key=lambda p: os.path.getsize(p))
-        df_main = pd.read_csv(main_file, low_memory=False)
-        st.caption(f"Loaded main file: {main_file}")
+        st.caption(f"Extracted files: {', '.join([os.path.basename(f) for f in extracted_files])}")
         
-        # Find building file (by name or assume second largest)
-        building_file = next((f for f in extracted_files if "building" in f.lower()), None)
+        # Find main parcel file (by name or largest)
+        main_file = next((f for f in extracted_files if "assessor" in f.lower() and "building" not in f.lower() and "improvement" not in f.lower()), None)
+        if not main_file:
+            main_file = max(extracted_files, key=lambda p: os.path.getsize(p))
+        st.caption(f"Loaded main file: {os.path.basename(main_file)}")
+        df_main = pd.read_csv(main_file, low_memory=False)
+        
+        # Find building file (by name)
+        building_file = next((f for f in extracted_files if any(word in f.lower() for word in ["building", "improvement"])), None)
         if building_file:
             df_building = pd.read_csv(building_file, low_memory=False)
-            st.caption(f"Loaded building file: {building_file}")
-            # Merge on MAP, GROUP, PARCEL (assume common columns)
+            st.caption(f"Loaded building file: {os.path.basename(building_file)}")
+            # Merge on MAP, GROUP, PARCEL
             merge_cols = ['MAP', 'GROUP', 'PARCEL']
             if all(c in df_main.columns and c in df_building.columns for c in merge_cols):
-                df = pd.merge(df_main, df_building, on=merge_cols, how='left')
+                df = pd.merge(df_main, df_building, on=merge_cols, how='left', suffixes=('', '_bldg'))
+                st.caption("Merged main and building data successfully.")
             else:
                 st.warning("Could not merge building data: missing merge columns.")
                 df = df_main
         else:
-            st.warning("No building file found; using main file only.")
+            st.warning("No building/improvement file found; using main file only.")
             df = df_main
         
-        df.attrs["source"] = f"ZIP → {main_file} (and building if available)"
+        df.attrs["source"] = f"ZIP → {os.path.basename(main_file)} (and building if available)"
         return df
     if csv_path:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -103,7 +108,7 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def safe_residential_filter(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    type_cols = ["PROP_TYPE_CODE_DESC", "CURRENT_USE_CODE_DESC", "LAND_USE_CODE_DESC"]
+    type_cols = ["PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC"]
     res_col = next((c for c in type_cols if c in df.columns), None)
     if res_col is None:
         return df
@@ -115,15 +120,16 @@ def safe_residential_filter(df: pd.DataFrame) -> pd.DataFrame:
 def build_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     y = df["APPRAISED_VALUE"].copy()
     # Define a few key features based on actual column names
-    possible_features = ["YearBuilt", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"]
+    possible_features = ["YearBuilt", "Bedrooms", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"]
     selected_features = [c for c in possible_features if c in df.columns]
     if not selected_features:
         raise ValueError("None of the selected key features are available in the dataset.")
     st.caption(f"Using these few features for modeling: {', '.join(selected_features)}")
     
     X_raw = df[selected_features].copy()
-    # Convert to numeric where possible
+    # Clean and convert to numeric
     for col in X_raw.columns:
+        X_raw[col] = X_raw[col].astype(str).str.replace(r'[^0-9\.-]', '', regex=True)
         X_raw[col] = pd.to_numeric(X_raw[col], errors="coerce")
     
     X = pd.get_dummies(X_raw, drop_first=True)  # In case any categoricals, but unlikely
@@ -194,7 +200,7 @@ st.metric("R²", f"{r2:.3f}")
 # ---------- Predict ----------
 st.subheader("Predict APPRAISED_VALUE")
 # The few features are the ones used in the model, so allow overrides for all available
-preferred_inputs = [c for c in ["YearBuilt", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"] if c in df_use.columns]
+preferred_inputs = [c for c in ["YearBuilt", "Bedrooms", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"] if c in df_use.columns]
 if preferred_inputs:
     st.caption("Enter values for the key features to predict the appraised value.")
     cols = st.columns(2)
