@@ -58,7 +58,7 @@ def train_model(df_model):
 
     categorical_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")), [cite: 13]
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
     ])
 
     preprocess = ColumnTransformer(
