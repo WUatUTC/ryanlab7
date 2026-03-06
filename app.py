@@ -45,8 +45,7 @@ def read_parcel_csv_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
     parcel_zip = download_zip_bytes(PARCEL_ZIP_URL)
-    df = read_parcel_csv_from_zip(parcel_zip)
-    return df
+    return read_parcel_csv_from_zip(parcel_zip)
 
 
 def clean_target(df: pd.DataFrame) -> pd.DataFrame:
@@ -56,7 +55,7 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
     df["APPRAISED_VALUE"] = clean_numeric_series(df["APPRAISED_VALUE"])
     df = df.dropna(subset=["APPRAISED_VALUE"])
-    df = df[df["APPRAISED_VALUE"] > 1000].copy()  # remove tiny/invalid values
+    df = df[df["APPRAISED_VALUE"] > 1000].copy()
     return df
 
 
@@ -78,12 +77,39 @@ def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def find_usable_features(df: pd.DataFrame):
+def auto_detect_numeric_features(df: pd.DataFrame) -> list[str]:
     """
-    Choose features only from columns that actually exist and have enough data.
-    Edit candidate list after checking your debug panel.
+    Automatically find usable numeric parcel columns.
     """
-    candidate_features = [
+    exclude_cols = {
+        "APPRAISED_VALUE",
+        "MAP", "GROUP", "PARCEL",
+        "OWNER_NAME", "OWNER_ADDRESS",
+        "PROPERTY_ADDRESS", "CITY", "STATE", "ZIP",
+        "PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC",
+        "TAX_DISTRICT", "DEED_BOOK", "DEED_PAGE",
+    }
+
+    candidate_cols = [c for c in df.columns if c not in exclude_cols]
+
+    usable = []
+    for col in candidate_cols:
+        s_num = clean_numeric_series(df[col])
+
+        non_missing = s_num.notna().sum()
+        nunique = s_num.nunique(dropna=True)
+
+        if non_missing >= 1000 and nunique >= 5:
+            usable.append(col)
+
+    return usable
+
+
+def choose_default_features(df: pd.DataFrame, max_features: int = 8) -> list[str]:
+    """
+    Prefer interpretable housing-related names first, then fall back to auto-detected numeric columns.
+    """
+    preferred = [
         "CALC_ACRES",
         "LAND_SQUARE_FOOTAGE",
         "TOTAL_ROOMS",
@@ -92,46 +118,42 @@ def find_usable_features(df: pd.DataFrame):
         "STORIES",
         "GRADE",
         "CONDITION",
-        "LIVING_AREA",
         "BUILDING_SQUARE_FEET",
+        "LIVING_AREA",
         "HEATED_AREA",
+        "BATHS",
+        "FULL_BATHS",
+        "HALF_BATHS",
     ]
 
-    available = [c for c in candidate_features if c in df.columns]
+    detected = auto_detect_numeric_features(df)
 
-    usable = []
-    for col in available:
-        vals = clean_numeric_series(df[col])
-        if vals.notna().sum() >= 100:
-            usable.append(col)
+    selected = [c for c in preferred if c in detected]
 
-    return usable
+    for col in detected:
+        if col not in selected:
+            selected.append(col)
+
+    return selected[:max_features]
 
 
-def build_xy(df: pd.DataFrame):
-    feature_names = find_usable_features(df)
+def build_xy(df: pd.DataFrame, selected_features: list[str]):
+    if not selected_features:
+        raise ValueError("No usable feature columns were selected.")
 
-    if not feature_names:
-        raise ValueError(
-            "No usable feature columns were found. Turn on debug info and inspect available columns."
-        )
-
-    X = df[feature_names].copy()
+    X = df[selected_features].copy()
     y = df["APPRAISED_VALUE"].copy()
 
     for col in X.columns:
         X[col] = clean_numeric_series(X[col])
 
-    # Clean obviously invalid values for selected common columns
-    if "YEAR_BUILT" in X.columns:
-        X.loc[(X["YEAR_BUILT"] < 1800) | (X["YEAR_BUILT"] > 2100), "YEAR_BUILT"] = pd.NA
+    # Light sanity cleaning for any year-like columns
+    for col in X.columns:
+        if "YEAR" in col:
+            X.loc[(X[col] < 1800) | (X[col] > 2100), col] = pd.NA
 
-    if "CALC_ACRES" in X.columns:
-        X.loc[(X["CALC_ACRES"] < 0) | (X["CALC_ACRES"] > 1000), "CALC_ACRES"] = pd.NA
-
-    X = X.dropna(axis=1, how="all")
-
-    usable_cols = [c for c in X.columns if X[c].notna().sum() >= 100]
+    # Remove columns that collapse after cleaning
+    usable_cols = [c for c in X.columns if X[c].notna().sum() >= 1000 and X[c].nunique(dropna=True) >= 5]
     X = X[usable_cols].copy()
 
     if X.empty:
@@ -144,7 +166,7 @@ def build_xy(df: pd.DataFrame):
 
     X, y = X.align(y, join="inner", axis=0)
 
-    if len(X) < 100:
+    if len(X) < 1000:
         raise ValueError(f"Not enough usable rows for training: {len(X)}")
 
     return X.astype(float), y.astype(float), list(X.columns), feature_defaults
@@ -165,30 +187,72 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     return model, mae, r2
 
 
+# -----------------------------
+# Load and clean first
+# -----------------------------
 st.title("Hamilton County Home Value Predictor")
 st.write("Enter property features to estimate appraised value.")
 
-show_debug = st.sidebar.checkbox("Show debug info", value=False)
+show_debug = st.sidebar.checkbox("Show debug info", value=True)
 use_residential = st.sidebar.checkbox("Use residential filter", value=True)
 
 try:
-    with st.spinner("Loading data and training model..."):
+    with st.spinner("Loading parcel data..."):
         df = load_data()
         df = clean_target(df)
 
         if use_residential:
             df_filtered = residential_filter(df)
-            if len(df_filtered) >= 100:
+            if len(df_filtered) >= 1000:
                 df = df_filtered
-
-        X, y, feature_names, feature_defaults = build_xy(df)
-        model, mae, r2 = train_model(X, y)
-
 except Exception as e:
-    st.error(f"App setup failed: {e}")
+    st.error(f"Data loading failed: {e}")
     st.stop()
 
-st.sidebar.header("Property Features")
+# -----------------------------
+# Detect features before train
+# -----------------------------
+detected_features = auto_detect_numeric_features(df)
+default_features = choose_default_features(df, max_features=8)
+
+if show_debug:
+    with st.expander("Available columns", expanded=False):
+        st.write(df.columns.tolist())
+
+    with st.expander("Auto-detected numeric feature candidates", expanded=True):
+        st.write(detected_features)
+
+    with st.expander("Preview of key data", expanded=False):
+        preview_cols = ["APPRAISED_VALUE"] + default_features[:6]
+        preview_cols = [c for c in preview_cols if c in df.columns]
+        st.dataframe(df[preview_cols].head(10))
+
+# Let user choose which detected numeric fields to use
+selected_features = st.sidebar.multiselect(
+    "Features used by model",
+    options=detected_features,
+    default=default_features,
+)
+
+if not selected_features:
+    st.warning("Please select at least one feature in the sidebar.")
+    st.stop()
+
+# -----------------------------
+# Build and train
+# -----------------------------
+try:
+    with st.spinner("Training model..."):
+        X, y, feature_names, feature_defaults = build_xy(df, selected_features)
+        model, mae, r2 = train_model(X, y)
+except Exception as e:
+    st.error(f"Model setup failed: {e}")
+    st.stop()
+
+# -----------------------------
+# Sidebar input controls
+# -----------------------------
+st.sidebar.header("Property Inputs")
 
 label_map = {
     "CALC_ACRES": "Lot Size (acres)",
@@ -199,12 +263,10 @@ label_map = {
     "STORIES": "Stories",
     "GRADE": "Grade",
     "CONDITION": "Condition",
-    "LIVING_AREA": "Living Area (sq ft)",
     "BUILDING_SQUARE_FEET": "Building Area (sq ft)",
+    "LIVING_AREA": "Living Area (sq ft)",
     "HEATED_AREA": "Heated Area (sq ft)",
 }
-
-integer_like = {"TOTAL_ROOMS", "BEDROOMS", "YEAR_BUILT", "STORIES", "GRADE", "CONDITION"}
 
 user_input = {}
 for col in feature_names:
@@ -214,7 +276,17 @@ for col in feature_names:
 
     label = label_map.get(col, col)
 
-    if col in integer_like:
+    is_integer_like = (
+        ("YEAR" in col) or
+        ("ROOM" in col) or
+        ("BED" in col) or
+        ("BATH" in col) or
+        ("STORY" in col) or
+        ("GRADE" in col) or
+        ("CONDITION" in col)
+    )
+
+    if is_integer_like:
         user_input[col] = st.sidebar.number_input(
             label,
             min_value=0,
@@ -243,6 +315,9 @@ except Exception as e:
     st.error(f"Prediction failed: {e}")
     st.stop()
 
+# -----------------------------
+# Main result display
+# -----------------------------
 st.subheader("Estimated Appraised Value")
 st.metric("Predicted Value", f"${prediction:,.0f}")
 
@@ -267,21 +342,14 @@ if show_debug:
     st.divider()
     st.subheader("Debug Information")
 
-    with st.expander("Available columns", expanded=False):
-        st.write(df.columns.tolist())
-
-    with st.expander("Selected features", expanded=True):
-        st.write(feature_names)
-
-    with st.expander("Non-missing counts for selected features", expanded=True):
+    with st.expander("Non-missing counts for selected features", expanded=False):
         st.write(df[feature_names].notna().sum())
 
-    with st.expander("First 10 rows of target + selected features", expanded=True):
-        cols = ["APPRAISED_VALUE"] + feature_names
-        st.dataframe(df[cols].head(10))
+    with st.expander("Cleaned feature matrix preview", expanded=False):
+        st.dataframe(X.head(10))
 
-    with st.expander("APPRAISED_VALUE summary", expanded=False):
-        st.write(df["APPRAISED_VALUE"].describe())
+    with st.expander("Target summary", expanded=False):
+        st.write(y.describe())
 
     with st.expander("Prediction row sent to model", expanded=False):
         st.dataframe(X_user)
