@@ -8,34 +8,24 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
-# --------------------------------------------------
-# Page setup
-# --------------------------------------------------
 st.set_page_config(page_title="Hamilton County Home Value Predictor", layout="wide")
 
 PARCEL_ZIP_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip"
-BUILDING_ZIP_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorBuildingExport.zip"
 
 
-# --------------------------------------------------
-# Helper functions
-# --------------------------------------------------
 def download_zip_bytes(url: str) -> bytes:
-    """Download ZIP file from URL and return raw bytes."""
     response = requests.get(url, timeout=120)
     response.raise_for_status()
     return response.content
 
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Make column names uppercase and trimmed."""
     df = df.copy()
     df.columns = [str(c).strip().upper() for c in df.columns]
     return df
 
 
 def clean_numeric_series(s: pd.Series) -> pd.Series:
-    """Convert mixed text/numeric values to numeric."""
     return pd.to_numeric(
         s.astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
         errors="coerce",
@@ -43,117 +33,34 @@ def clean_numeric_series(s: pd.Series) -> pd.Series:
 
 
 def read_parcel_csv_from_zip(zip_bytes: bytes) -> pd.DataFrame:
-    """Read parcel CSV from ZIP."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_files = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csv_files:
             raise FileNotFoundError("No CSV file found in parcel ZIP.")
-
         with zf.open(csv_files[0]) as f:
             df = pd.read_csv(f, low_memory=False)
-
     return normalize_cols(df)
-
-
-def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
-    """
-    Read building export from ZIP.
-    Try CSV first. If TXT exists, parse as fixed-width text.
-    """
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names_in_zip = zf.namelist()
-        csv_files = [n for n in names_in_zip if n.lower().endswith(".csv")]
-        txt_files = [n for n in names_in_zip if n.lower().endswith(".txt")]
-
-        if csv_files:
-            with zf.open(csv_files[0]) as f:
-                df = pd.read_csv(f, low_memory=False)
-            return normalize_cols(df)
-
-        if txt_files:
-            with zf.open(txt_files[0]) as f:
-                # Current tentative fixed-width locations used for key building fields
-                colspecs = [
-                    (0, 12),      # MAP
-                    (12, 24),     # GROUP
-                    (24, 36),     # PARCEL
-                    (156, 160),   # YEARBUILT
-                    (180, 200),   # SIZEAREA
-                    (945, 949),   # FULLBATH
-                    (949, 953),   # THREEQUARTERBATH
-                    (953, 957),   # HALFBATH
-                ]
-                names = [
-                    "MAP",
-                    "GROUP",
-                    "PARCEL",
-                    "YEARBUILT",
-                    "SIZEAREA",
-                    "FULLBATH",
-                    "THREEQUARTERBATH",
-                    "HALFBATH",
-                ]
-                df = pd.read_fwf(f, colspecs=colspecs, names=names, dtype=str)
-
-            return normalize_cols(df)
-
-        raise FileNotFoundError("No CSV or TXT file found in building ZIP.")
 
 
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
-    """Download parcel and building data and merge them."""
     parcel_zip = download_zip_bytes(PARCEL_ZIP_URL)
-    building_zip = download_zip_bytes(BUILDING_ZIP_URL)
-
-    df_parcel = read_parcel_csv_from_zip(parcel_zip)
-    df_building = read_building_file_from_zip(building_zip)
-
-    merge_cols = ["MAP", "GROUP", "PARCEL"]
-
-    missing_parcel = [c for c in merge_cols if c not in df_parcel.columns]
-    missing_building = [c for c in merge_cols if c not in df_building.columns]
-
-    if missing_parcel:
-        raise KeyError(f"Parcel file missing merge columns: {missing_parcel}")
-    if missing_building:
-        raise KeyError(f"Building file missing merge columns: {missing_building}")
-
-    keep_cols = merge_cols + [
-        "YEARBUILT",
-        "SIZEAREA",
-        "FULLBATH",
-        "THREEQUARTERBATH",
-        "HALFBATH",
-    ]
-    keep_cols = [c for c in keep_cols if c in df_building.columns]
-
-    df_building = df_building[keep_cols].copy()
-
-    agg_map = {c: "max" for c in keep_cols if c not in merge_cols}
-    if agg_map:
-        df_building = df_building.groupby(merge_cols, as_index=False).agg(agg_map)
-    else:
-        df_building = df_building.drop_duplicates(subset=merge_cols)
-
-    df = pd.merge(df_parcel, df_building, on=merge_cols, how="left")
+    df = read_parcel_csv_from_zip(parcel_zip)
     return df
 
 
 def clean_target(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean APPRAISED_VALUE and keep only positive values."""
     df = df.copy()
     if "APPRAISED_VALUE" not in df.columns:
         raise KeyError("APPRAISED_VALUE column not found.")
 
     df["APPRAISED_VALUE"] = clean_numeric_series(df["APPRAISED_VALUE"])
     df = df.dropna(subset=["APPRAISED_VALUE"])
-    df = df[df["APPRAISED_VALUE"] > 0].copy()
+    df = df[df["APPRAISED_VALUE"] > 1000].copy()  # remove tiny/invalid values
     return df
 
 
 def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """Try to keep residential-like properties using coded fields first."""
     df = df.copy()
 
     if "PROP_TYPE_CODE" in df.columns:
@@ -168,35 +75,46 @@ def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
         if mask.sum() >= 100:
             return df[mask].copy()
 
-    desc_cols = ["PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC"]
-    pattern = (
-        r"RESIDENTIAL|RENTAL|APARTMENT|CONDOMINIUM|CONDO|DUPLEX|TRIPLEX|"
-        r"ONE FAMILY|HOUSEHOLD UNIT|MOBILE HOME"
-    )
-
-    for col in desc_cols:
-        if col in df.columns:
-            mask = df[col].astype(str).str.upper().str.contains(pattern, na=False, regex=True)
-            if mask.sum() >= 100:
-                return df[mask].copy()
-
     return df
 
 
-def build_xy(df: pd.DataFrame):
-    """Build cleaned feature matrix and target."""
-    feature_candidates = [
-        "YEARBUILT",
-        "SIZEAREA",
-        "FULLBATH",
-        "THREEQUARTERBATH",
-        "HALFBATH",
+def find_usable_features(df: pd.DataFrame):
+    """
+    Choose features only from columns that actually exist and have enough data.
+    Edit candidate list after checking your debug panel.
+    """
+    candidate_features = [
         "CALC_ACRES",
+        "LAND_SQUARE_FOOTAGE",
+        "TOTAL_ROOMS",
+        "BEDROOMS",
+        "YEAR_BUILT",
+        "STORIES",
+        "GRADE",
+        "CONDITION",
+        "LIVING_AREA",
+        "BUILDING_SQUARE_FEET",
+        "HEATED_AREA",
     ]
-    feature_names = [c for c in feature_candidates if c in df.columns]
+
+    available = [c for c in candidate_features if c in df.columns]
+
+    usable = []
+    for col in available:
+        vals = clean_numeric_series(df[col])
+        if vals.notna().sum() >= 100:
+            usable.append(col)
+
+    return usable
+
+
+def build_xy(df: pd.DataFrame):
+    feature_names = find_usable_features(df)
 
     if not feature_names:
-        raise ValueError("No expected feature columns were found.")
+        raise ValueError(
+            "No usable feature columns were found. Turn on debug info and inspect available columns."
+        )
 
     X = df[feature_names].copy()
     y = df["APPRAISED_VALUE"].copy()
@@ -204,10 +122,15 @@ def build_xy(df: pd.DataFrame):
     for col in X.columns:
         X[col] = clean_numeric_series(X[col])
 
-    if "YEARBUILT" in X.columns:
-        X.loc[(X["YEARBUILT"] < 1800) | (X["YEARBUILT"] > 2100), "YEARBUILT"] = pd.NA
+    # Clean obviously invalid values for selected common columns
+    if "YEAR_BUILT" in X.columns:
+        X.loc[(X["YEAR_BUILT"] < 1800) | (X["YEAR_BUILT"] > 2100), "YEAR_BUILT"] = pd.NA
 
-    # Keep columns with a reasonable amount of usable data
+    if "CALC_ACRES" in X.columns:
+        X.loc[(X["CALC_ACRES"] < 0) | (X["CALC_ACRES"] > 1000), "CALC_ACRES"] = pd.NA
+
+    X = X.dropna(axis=1, how="all")
+
     usable_cols = [c for c in X.columns if X[c].notna().sum() >= 100]
     X = X[usable_cols].copy()
 
@@ -228,7 +151,6 @@ def build_xy(df: pd.DataFrame):
 
 
 def train_model(X: pd.DataFrame, y: pd.Series):
-    """Train linear regression model."""
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.20, random_state=42
     )
@@ -243,18 +165,12 @@ def train_model(X: pd.DataFrame, y: pd.Series):
     return model, mae, r2
 
 
-# --------------------------------------------------
-# Main UI
-# --------------------------------------------------
 st.title("Hamilton County Home Value Predictor")
-st.write("Enter a few property features to estimate appraised value.")
+st.write("Enter property features to estimate appraised value.")
 
 show_debug = st.sidebar.checkbox("Show debug info", value=False)
 use_residential = st.sidebar.checkbox("Use residential filter", value=True)
 
-# --------------------------------------------------
-# Load, clean, prepare, train
-# --------------------------------------------------
 try:
     with st.spinner("Loading data and training model..."):
         df = load_data()
@@ -272,19 +188,23 @@ except Exception as e:
     st.error(f"App setup failed: {e}")
     st.stop()
 
-# --------------------------------------------------
-# Sidebar inputs
-# --------------------------------------------------
 st.sidebar.header("Property Features")
 
 label_map = {
-    "YEARBUILT": "Year Built",
-    "SIZEAREA": "Building Area (sq ft)",
-    "FULLBATH": "Full Bathrooms",
-    "THREEQUARTERBATH": "3/4 Bathrooms",
-    "HALFBATH": "Half Bathrooms",
     "CALC_ACRES": "Lot Size (acres)",
+    "LAND_SQUARE_FOOTAGE": "Land Area (sq ft)",
+    "TOTAL_ROOMS": "Total Rooms",
+    "BEDROOMS": "Bedrooms",
+    "YEAR_BUILT": "Year Built",
+    "STORIES": "Stories",
+    "GRADE": "Grade",
+    "CONDITION": "Condition",
+    "LIVING_AREA": "Living Area (sq ft)",
+    "BUILDING_SQUARE_FEET": "Building Area (sq ft)",
+    "HEATED_AREA": "Heated Area (sq ft)",
 }
+
+integer_like = {"TOTAL_ROOMS", "BEDROOMS", "YEAR_BUILT", "STORIES", "GRADE", "CONDITION"}
 
 user_input = {}
 for col in feature_names:
@@ -292,18 +212,18 @@ for col in feature_names:
     if pd.isna(default_val):
         default_val = 0.0
 
-    nice_label = label_map.get(col, col)
+    label = label_map.get(col, col)
 
-    if col in ["YEARBUILT", "FULLBATH", "THREEQUARTERBATH", "HALFBATH"]:
+    if col in integer_like:
         user_input[col] = st.sidebar.number_input(
-            nice_label,
+            label,
             min_value=0,
             value=int(round(float(default_val))),
             step=1,
         )
     else:
         user_input[col] = st.sidebar.number_input(
-            nice_label,
+            label,
             min_value=0.0,
             value=float(default_val),
             step=0.1,
@@ -323,9 +243,6 @@ except Exception as e:
     st.error(f"Prediction failed: {e}")
     st.stop()
 
-# --------------------------------------------------
-# Main result display
-# --------------------------------------------------
 st.subheader("Estimated Appraised Value")
 st.metric("Predicted Value", f"${prediction:,.0f}")
 
@@ -343,42 +260,28 @@ with col2:
     st.write(f"**R²:** {r2:.3f}")
 
 st.caption(
-    "This app is for educational demonstration only. Predictions come from a simple linear regression model trained on public assessor data."
+    "This tool is for educational demonstration only. Predictions are based on a simple linear regression model trained on public assessor data."
 )
 
-# --------------------------------------------------
-# Optional debug section
-# --------------------------------------------------
 if show_debug:
     st.divider()
     st.subheader("Debug Information")
 
-    debug_cols = [
-        "APPRAISED_VALUE",
-        "CALC_ACRES",
-        "YEARBUILT",
-        "SIZEAREA",
-        "FULLBATH",
-        "THREEQUARTERBATH",
-        "HALFBATH",
-    ]
-    existing_debug_cols = [c for c in debug_cols if c in df.columns]
+    with st.expander("Available columns", expanded=False):
+        st.write(df.columns.tolist())
 
-    with st.expander("First 10 rows of key columns", expanded=True):
-        st.write("Available debug columns:", existing_debug_cols)
-        st.dataframe(df[existing_debug_cols].head(10))
+    with st.expander("Selected features", expanded=True):
+        st.write(feature_names)
 
-    with st.expander("Non-missing counts", expanded=True):
-        st.write(df[existing_debug_cols].notna().sum())
+    with st.expander("Non-missing counts for selected features", expanded=True):
+        st.write(df[feature_names].notna().sum())
 
-    with st.expander("APPRAISED_VALUE summary", expanded=True):
+    with st.expander("First 10 rows of target + selected features", expanded=True):
+        cols = ["APPRAISED_VALUE"] + feature_names
+        st.dataframe(df[cols].head(10))
+
+    with st.expander("APPRAISED_VALUE summary", expanded=False):
         st.write(df["APPRAISED_VALUE"].describe())
 
-    with st.expander("Cleaned feature matrix preview", expanded=True):
-        st.write("Feature names used:", feature_names)
-        st.write("Non-missing counts in X:")
-        st.write(X.notna().sum())
-        st.dataframe(X.head(10))
-
-    with st.expander("Prediction row sent to model", expanded=True):
+    with st.expander("Prediction row sent to model", expanded=False):
         st.dataframe(X_user)
