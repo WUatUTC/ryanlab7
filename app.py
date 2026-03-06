@@ -16,7 +16,7 @@ st.set_page_config(page_title="Hamilton County Properties Predictor", layout="ce
 def load_data():
     # 👉 PASTE YOUR RAW URL HERE 👈
     # Example GitHub Raw URL or Dropbox direct link (dl=1)
-    data_url = "YOUR_RAW_URL_HERE" 
+    data_url = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip" 
     
     try:
         # If using your compressed CSV:
