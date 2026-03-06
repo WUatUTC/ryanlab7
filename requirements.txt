@@ -1,0 +1,6 @@
+pandas
+numpy
+scikit-learn
+altair<5
+streamlit
+standard-imghdr
