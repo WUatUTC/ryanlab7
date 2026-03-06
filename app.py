@@ -1,7 +1,6 @@
 import io
 import zipfile
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -35,7 +34,7 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean_numeric_series(s: pd.Series) -> pd.Series:
-    """Convert text/numeric mixed values to numeric."""
+    """Convert mixed text/numeric values to numeric."""
     return pd.to_numeric(
         s.astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
         errors="coerce"
@@ -61,9 +60,9 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
     Try CSV first. If TXT, parse as fixed-width text.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names = zf.namelist()
-        csv_files = [n for n in names if n.lower().endswith(".csv")]
-        txt_files = [n for n in names if n.lower().endswith(".txt")]
+        names_in_zip = zf.namelist()
+        csv_files = [n for n in names_in_zip if n.lower().endswith(".csv")]
+        txt_files = [n for n in names_in_zip if n.lower().endswith(".txt")]
 
         if csv_files:
             with zf.open(csv_files[0]) as f:
@@ -72,7 +71,7 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 
         if txt_files:
             with zf.open(txt_files[0]) as f:
-                # Fixed-width positions based on county building extract layout
+                # Based on the county building extract layout
                 colspecs = [
                     (0, 12),      # MAP
                     (12, 24),     # GROUP
@@ -130,7 +129,7 @@ def load_data() -> pd.DataFrame:
 
     df_building = df_building[keep_cols].copy()
 
-    # Multiple buildings per parcel -> aggregate to one parcel row
+    # Some parcels may have multiple building records
     agg_map = {c: "max" for c in keep_cols if c not in merge_cols}
     df_building = df_building.groupby(merge_cols, as_index=False).agg(agg_map)
 
@@ -151,16 +150,40 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """Filter to residential-like properties if possible."""
+    """
+    Filter to residential-like properties using county coded fields first,
+    then description fields as fallback.
+    """
     df = df.copy()
 
-    for col in ["PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC"]:
+    # 1) Property type code
+    if "PROP_TYPE_CODE" in df.columns:
+        prop_code = pd.to_numeric(df["PROP_TYPE_CODE"], errors="coerce")
+        mask = prop_code.isin([22, 32, 40])
+        if mask.any():
+            return df[mask].copy()
+
+    # 2) Land use code
+    if "LAND_USE_CODE" in df.columns:
+        lu = pd.to_numeric(df["LAND_USE_CODE"], errors="coerce")
+        mask = ((lu >= 100) & (lu < 200)) | lu.isin([111, 112, 113, 114, 115, 116, 117])
+        if mask.any():
+            return df[mask].copy()
+
+    # 3) Description fallback
+    desc_cols = [
+        "PROP_TYPE_CODE_DESC",
+        "LAND_USE_CODE_DESC",
+        "CURRENT_USE_CODE_DESC",
+    ]
+    pattern = (
+        r"RESIDENTIAL|RENTAL|APARTMENT|CONDOMINIUM|CONDO|DUPLEX|TRIPLEX|"
+        r"ONE FAMILY|HOUSEHOLD UNIT|MOBILE HOME"
+    )
+
+    for col in desc_cols:
         if col in df.columns:
-            mask = df[col].astype(str).str.contains(
-                r"RESIDENT|RES|HOUSE|HOME|CONDO|DUPLEX|TRIPLEX|APART",
-                case=False,
-                na=False,
-            )
+            mask = df[col].astype(str).str.upper().str.contains(pattern, na=False, regex=True)
             if mask.any():
                 return df[mask].copy()
 
@@ -187,6 +210,10 @@ def build_xy(df: pd.DataFrame):
 
     for col in X.columns:
         X[col] = clean_numeric_series(X[col])
+
+    # remove impossible years if present
+    if "YEARBUILT" in X.columns:
+        X.loc[(X["YEARBUILT"] < 1800) | (X["YEARBUILT"] > 2100), "YEARBUILT"] = pd.NA
 
     X = X.dropna(axis=1, how="all")
     X = X.fillna(X.median(numeric_only=True))
@@ -228,7 +255,6 @@ except Exception as e:
 st.success("Data loaded successfully.")
 st.write("Total rows loaded:", len(df))
 
-# Optional debug display
 with st.expander("Show available columns"):
     st.write(df.columns.tolist())
 
@@ -242,10 +268,27 @@ except Exception as e:
     st.stop()
 
 use_residential = st.checkbox("Filter to residential properties", value=True)
-df_use = residential_filter(df) if use_residential else df
+
+if use_residential:
+    df_use = residential_filter(df)
+    if len(df_use) < 100:
+        st.warning(
+            f"Residential filter returned only {len(df_use)} rows. "
+            "Using the full cleaned dataset instead."
+        )
+        df_use = df.copy()
+else:
+    df_use = df.copy()
 
 st.write("Rows after target cleaning:", len(df))
 st.write("Rows used for modeling:", len(df_use))
+
+# Helpful diagnostics during development
+with st.expander("Filter diagnostics"):
+    for col in ["PROP_TYPE_CODE", "PROP_TYPE_CODE_DESC", "LAND_USE_CODE", "LAND_USE_CODE_DESC"]:
+        if col in df.columns:
+            sample_vals = df[col].dropna().astype(str).head(10).tolist()
+            st.write(f"{col} sample values:", sample_vals)
 
 if len(df_use) == 0:
     st.error("No rows available after filtering.")
