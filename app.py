@@ -150,6 +150,9 @@ def build_xy(df: pd.DataFrame):
     ]
     feature_names = [c for c in feature_candidates if c in df.columns]
 
+    if not feature_names:
+        raise ValueError("No verified feature columns found in dataset.")
+
     X = df[feature_names].copy()
     y = df["APPRAISED_VALUE"].copy()
 
@@ -159,8 +162,17 @@ def build_xy(df: pd.DataFrame):
     if "YEARBUILT" in X.columns:
         X.loc[(X["YEARBUILT"] < 1800) | (X["YEARBUILT"] > 2100), "YEARBUILT"] = pd.NA
 
-    # Drop columns that are almost entirely missing
+    st.write("Feature non-missing counts before filtering:")
+    st.write(X.notna().sum())
+
+    st.write("Feature sample rows:")
+    st.write(X.head(10))
+
+    X = X.dropna(axis=1, how="all")
+
     usable_cols = [c for c in X.columns if X[c].notna().sum() >= 100]
+    st.write("Usable columns:", usable_cols)
+
     X = X[usable_cols].copy()
 
     if X.empty:
@@ -169,13 +181,10 @@ def build_xy(df: pd.DataFrame):
     feature_defaults = X.median(numeric_only=True).to_dict()
     X = X.fillna(pd.Series(feature_defaults))
 
-    X = X.replace([float("inf"), float("-inf")], pd.NA)
-    X = X.fillna(pd.Series(feature_defaults))
-
     X, y = X.align(y, join="inner", axis=0)
 
-    if len(X) < 100:
-        raise ValueError(f"Not enough usable rows for training: {len(X)}")
+    st.write("Target summary:")
+    st.write(y.describe())
 
     return X.astype(float), y.astype(float), list(X.columns), feature_defaults
 
