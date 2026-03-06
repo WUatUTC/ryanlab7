@@ -8,25 +8,34 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
+# --------------------------------------------------
+# Page setup
+# --------------------------------------------------
 st.set_page_config(page_title="Hamilton County Home Value Predictor", layout="wide")
 
 PARCEL_ZIP_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip"
 BUILDING_ZIP_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorBuildingExport.zip"
 
 
+# --------------------------------------------------
+# Helper functions
+# --------------------------------------------------
 def download_zip_bytes(url: str) -> bytes:
+    """Download ZIP file from URL and return raw bytes."""
     response = requests.get(url, timeout=120)
     response.raise_for_status()
     return response.content
 
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Make column names uppercase and trimmed."""
     df = df.copy()
     df.columns = [str(c).strip().upper() for c in df.columns]
     return df
 
 
 def clean_numeric_series(s: pd.Series) -> pd.Series:
+    """Convert mixed text/numeric values to numeric."""
     return pd.to_numeric(
         s.astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
         errors="coerce",
@@ -34,16 +43,23 @@ def clean_numeric_series(s: pd.Series) -> pd.Series:
 
 
 def read_parcel_csv_from_zip(zip_bytes: bytes) -> pd.DataFrame:
+    """Read parcel CSV from ZIP."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_files = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csv_files:
             raise FileNotFoundError("No CSV file found in parcel ZIP.")
+
         with zf.open(csv_files[0]) as f:
             df = pd.read_csv(f, low_memory=False)
+
     return normalize_cols(df)
 
 
 def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
+    """
+    Read building export from ZIP.
+    Try CSV first. If TXT exists, parse as fixed-width text.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names_in_zip = zf.namelist()
         csv_files = [n for n in names_in_zip if n.lower().endswith(".csv")]
@@ -56,6 +72,7 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 
         if txt_files:
             with zf.open(txt_files[0]) as f:
+                # Current tentative fixed-width locations used for key building fields
                 colspecs = [
                     (0, 12),      # MAP
                     (12, 24),     # GROUP
@@ -77,6 +94,7 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
                     "HALFBATH",
                 ]
                 df = pd.read_fwf(f, colspecs=colspecs, names=names, dtype=str)
+
             return normalize_cols(df)
 
         raise FileNotFoundError("No CSV or TXT file found in building ZIP.")
@@ -84,6 +102,7 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
+    """Download parcel and building data and merge them."""
     parcel_zip = download_zip_bytes(PARCEL_ZIP_URL)
     building_zip = download_zip_bytes(BUILDING_ZIP_URL)
 
@@ -91,6 +110,14 @@ def load_data() -> pd.DataFrame:
     df_building = read_building_file_from_zip(building_zip)
 
     merge_cols = ["MAP", "GROUP", "PARCEL"]
+
+    missing_parcel = [c for c in merge_cols if c not in df_parcel.columns]
+    missing_building = [c for c in merge_cols if c not in df_building.columns]
+
+    if missing_parcel:
+        raise KeyError(f"Parcel file missing merge columns: {missing_parcel}")
+    if missing_building:
+        raise KeyError(f"Building file missing merge columns: {missing_building}")
 
     keep_cols = merge_cols + [
         "YEARBUILT",
@@ -100,17 +127,21 @@ def load_data() -> pd.DataFrame:
         "HALFBATH",
     ]
     keep_cols = [c for c in keep_cols if c in df_building.columns]
+
     df_building = df_building[keep_cols].copy()
 
     agg_map = {c: "max" for c in keep_cols if c not in merge_cols}
     if agg_map:
         df_building = df_building.groupby(merge_cols, as_index=False).agg(agg_map)
+    else:
+        df_building = df_building.drop_duplicates(subset=merge_cols)
 
     df = pd.merge(df_parcel, df_building, on=merge_cols, how="left")
     return df
 
 
 def clean_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean APPRAISED_VALUE and keep only positive values."""
     df = df.copy()
     if "APPRAISED_VALUE" not in df.columns:
         raise KeyError("APPRAISED_VALUE column not found.")
@@ -122,6 +153,7 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Try to keep residential-like properties using coded fields first."""
     df = df.copy()
 
     if "PROP_TYPE_CODE" in df.columns:
@@ -136,10 +168,23 @@ def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
         if mask.sum() >= 100:
             return df[mask].copy()
 
+    desc_cols = ["PROP_TYPE_CODE_DESC", "LAND_USE_CODE_DESC", "CURRENT_USE_CODE_DESC"]
+    pattern = (
+        r"RESIDENTIAL|RENTAL|APARTMENT|CONDOMINIUM|CONDO|DUPLEX|TRIPLEX|"
+        r"ONE FAMILY|HOUSEHOLD UNIT|MOBILE HOME"
+    )
+
+    for col in desc_cols:
+        if col in df.columns:
+            mask = df[col].astype(str).str.upper().str.contains(pattern, na=False, regex=True)
+            if mask.sum() >= 100:
+                return df[mask].copy()
+
     return df
 
 
 def build_xy(df: pd.DataFrame):
+    """Build cleaned feature matrix and target."""
     feature_candidates = [
         "YEARBUILT",
         "SIZEAREA",
@@ -151,7 +196,7 @@ def build_xy(df: pd.DataFrame):
     feature_names = [c for c in feature_candidates if c in df.columns]
 
     if not feature_names:
-        raise ValueError("No verified feature columns found in dataset.")
+        raise ValueError("No expected feature columns were found.")
 
     X = df[feature_names].copy()
     y = df["APPRAISED_VALUE"].copy()
@@ -162,41 +207,28 @@ def build_xy(df: pd.DataFrame):
     if "YEARBUILT" in X.columns:
         X.loc[(X["YEARBUILT"] < 1800) | (X["YEARBUILT"] > 2100), "YEARBUILT"] = pd.NA
 
-    st.write("Feature non-missing counts before filtering:")
-    st.write(X.notna().sum())
-
-    st.write("Feature sample rows:")
-    st.write(X.head(10))
-
-    X = X.dropna(axis=1, how="all")
-
+    # Keep columns with a reasonable amount of usable data
     usable_cols = [c for c in X.columns if X[c].notna().sum() >= 100]
-    st.write("Usable columns:", usable_cols)
-
     X = X[usable_cols].copy()
 
     if X.empty:
-        raise ValueError("No usable predictor columns found after cleaning.")
+        raise ValueError("No usable predictor columns remain after cleaning.")
 
     feature_defaults = X.median(numeric_only=True).to_dict()
+    X = X.fillna(pd.Series(feature_defaults))
+    X = X.replace([float("inf"), float("-inf")], pd.NA)
     X = X.fillna(pd.Series(feature_defaults))
 
     X, y = X.align(y, join="inner", axis=0)
 
-    st.write("Target summary:")
-    st.write(y.describe())
+    if len(X) < 100:
+        raise ValueError(f"Not enough usable rows for training: {len(X)}")
 
     return X.astype(float), y.astype(float), list(X.columns), feature_defaults
 
 
-@st.cache_resource(show_spinner=False)
-def train_model():
-    df = load_data()
-    df = clean_target(df)
-    df = residential_filter(df)
-
-    X, y, feature_names, feature_defaults = build_xy(df)
-
+def train_model(X: pd.DataFrame, y: pd.Series):
+    """Train linear regression model."""
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.20, random_state=42
     )
@@ -208,24 +240,42 @@ def train_model():
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
 
-    return model, mae, r2, feature_names, feature_defaults
+    return model, mae, r2
 
 
-# ----------------------------
-# App UI
-# ----------------------------
+# --------------------------------------------------
+# Main UI
+# --------------------------------------------------
 st.title("Hamilton County Home Value Predictor")
-st.markdown("Enter a few property features in the sidebar to estimate appraised value.")
+st.write("Enter a few property features to estimate appraised value.")
 
+show_debug = st.sidebar.checkbox("Show debug info", value=False)
+use_residential = st.sidebar.checkbox("Use residential filter", value=True)
+
+# --------------------------------------------------
+# Load, clean, prepare, train
+# --------------------------------------------------
 try:
     with st.spinner("Loading data and training model..."):
-        model, mae, r2, feature_names, feature_defaults = train_model()
+        df = load_data()
+        df = clean_target(df)
+
+        if use_residential:
+            df_filtered = residential_filter(df)
+            if len(df_filtered) >= 100:
+                df = df_filtered
+
+        X, y, feature_names, feature_defaults = build_xy(df)
+        model, mae, r2 = train_model(X, y)
+
 except Exception as e:
     st.error(f"App setup failed: {e}")
     st.stop()
 
+# --------------------------------------------------
 # Sidebar inputs
-st.sidebar.header("Enter Property Features")
+# --------------------------------------------------
+st.sidebar.header("Property Features")
 
 label_map = {
     "YEARBUILT": "Year Built",
@@ -267,26 +317,68 @@ X_user = X_user.replace([float("inf"), float("-inf")], pd.NA)
 X_user = X_user.fillna(pd.Series(feature_defaults))
 X_user = X_user.astype(float)
 
-prediction = float(model.predict(X_user)[0])
+try:
+    prediction = float(model.predict(X_user)[0])
+except Exception as e:
+    st.error(f"Prediction failed: {e}")
+    st.stop()
 
-# Main display
+# --------------------------------------------------
+# Main result display
+# --------------------------------------------------
 st.subheader("Estimated Appraised Value")
-st.metric(label="Predicted Value", value=f"${prediction:,.0f}")
+st.metric("Predicted Value", f"${prediction:,.0f}")
 
-st.divider()
+col1, col2 = st.columns(2)
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("### Property Inputs")
+with col1:
+    st.markdown("### Inputs Used")
     for col in feature_names:
         st.write(f"**{label_map.get(col, col)}:** {user_input[col]}")
 
-with c2:
-    st.markdown("### Model Summary")
+with col2:
+    st.markdown("### Model Information")
     st.write(f"**Features used:** {', '.join(label_map.get(c, c) for c in feature_names)}")
     st.write(f"**Mean Absolute Error:** ${mae:,.0f}")
     st.write(f"**R²:** {r2:.3f}")
 
 st.caption(
-    "This tool is for educational demonstration only. Predictions are based on a simple linear regression model trained on publicly available assessor data."
+    "This app is for educational demonstration only. Predictions come from a simple linear regression model trained on public assessor data."
 )
+
+# --------------------------------------------------
+# Optional debug section
+# --------------------------------------------------
+if show_debug:
+    st.divider()
+    st.subheader("Debug Information")
+
+    debug_cols = [
+        "APPRAISED_VALUE",
+        "CALC_ACRES",
+        "YEARBUILT",
+        "SIZEAREA",
+        "FULLBATH",
+        "THREEQUARTERBATH",
+        "HALFBATH",
+    ]
+    existing_debug_cols = [c for c in debug_cols if c in df.columns]
+
+    with st.expander("First 10 rows of key columns", expanded=True):
+        st.write("Available debug columns:", existing_debug_cols)
+        st.dataframe(df[existing_debug_cols].head(10))
+
+    with st.expander("Non-missing counts", expanded=True):
+        st.write(df[existing_debug_cols].notna().sum())
+
+    with st.expander("APPRAISED_VALUE summary", expanded=True):
+        st.write(df["APPRAISED_VALUE"].describe())
+
+    with st.expander("Cleaned feature matrix preview", expanded=True):
+        st.write("Feature names used:", feature_names)
+        st.write("Non-missing counts in X:")
+        st.write(X.notna().sum())
+        st.dataframe(X.head(10))
+
+    with st.expander("Prediction row sent to model", expanded=True):
+        st.dataframe(X_user)
