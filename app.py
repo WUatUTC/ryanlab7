@@ -20,14 +20,14 @@ BUILDING_ZIP_URL = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorBuildi
 
 
 def download_zip_bytes(url: str) -> bytes:
-    """Download ZIP file from URL and return raw bytes."""
+    """Download a ZIP file from a URL and return raw bytes."""
     response = requests.get(url, timeout=120)
     response.raise_for_status()
     return response.content
 
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize column names."""
+    """Standardize column names to uppercase with trimmed spaces."""
     df = df.copy()
     df.columns = [str(c).strip().upper() for c in df.columns]
     return df
@@ -37,12 +37,12 @@ def clean_numeric_series(s: pd.Series) -> pd.Series:
     """Convert mixed text/numeric values to numeric."""
     return pd.to_numeric(
         s.astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
-        errors="coerce"
+        errors="coerce",
     )
 
 
 def read_parcel_csv_from_zip(zip_bytes: bytes) -> pd.DataFrame:
-    """Read parcel CSV from ZIP."""
+    """Read the parcel CSV from ZIP."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         csv_files = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csv_files:
@@ -57,7 +57,7 @@ def read_parcel_csv_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
     """
     Read building export from ZIP.
-    Try CSV first. If TXT, parse as fixed-width text.
+    Try CSV first. If TXT exists, parse as fixed-width text.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names_in_zip = zf.namelist()
@@ -71,7 +71,6 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 
         if txt_files:
             with zf.open(txt_files[0]) as f:
-                # Based on the county building extract layout
                 colspecs = [
                     (0, 12),      # MAP
                     (12, 24),     # GROUP
@@ -101,7 +100,7 @@ def read_building_file_from_zip(zip_bytes: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=True)
 def load_data() -> pd.DataFrame:
-    """Download and merge parcel + building data."""
+    """Download and merge parcel and building data."""
     parcel_zip = download_zip_bytes(PARCEL_ZIP_URL)
     building_zip = download_zip_bytes(BUILDING_ZIP_URL)
 
@@ -129,16 +128,19 @@ def load_data() -> pd.DataFrame:
 
     df_building = df_building[keep_cols].copy()
 
-    # Some parcels may have multiple building records
+    # Some parcels may have multiple building rows
     agg_map = {c: "max" for c in keep_cols if c not in merge_cols}
-    df_building = df_building.groupby(merge_cols, as_index=False).agg(agg_map)
+    if agg_map:
+        df_building = df_building.groupby(merge_cols, as_index=False).agg(agg_map)
+    else:
+        df_building = df_building.drop_duplicates(subset=merge_cols)
 
     df = pd.merge(df_parcel, df_building, on=merge_cols, how="left")
     return df
 
 
 def clean_target(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean APPRAISED_VALUE."""
+    """Clean APPRAISED_VALUE and keep only positive values."""
     df = df.copy()
     if "APPRAISED_VALUE" not in df.columns:
         raise KeyError("APPRAISED_VALUE column not found.")
@@ -151,26 +153,23 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Filter to residential-like properties using county coded fields first,
+    Filter to residential-like properties using coded fields first,
     then description fields as fallback.
     """
     df = df.copy()
 
-    # 1) Property type code
     if "PROP_TYPE_CODE" in df.columns:
         prop_code = pd.to_numeric(df["PROP_TYPE_CODE"], errors="coerce")
         mask = prop_code.isin([22, 32, 40])
         if mask.any():
             return df[mask].copy()
 
-    # 2) Land use code
     if "LAND_USE_CODE" in df.columns:
         lu = pd.to_numeric(df["LAND_USE_CODE"], errors="coerce")
         mask = ((lu >= 100) & (lu < 200)) | lu.isin([111, 112, 113, 114, 115, 116, 117])
         if mask.any():
             return df[mask].copy()
 
-    # 3) Description fallback
     desc_cols = [
         "PROP_TYPE_CODE_DESC",
         "LAND_USE_CODE_DESC",
@@ -191,7 +190,7 @@ def residential_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_xy(df: pd.DataFrame):
-    """Build feature matrix and target."""
+    """Build cleaned feature matrix, target, and feature defaults."""
     feature_candidates = [
         "YEARBUILT",
         "SIZEAREA",
@@ -211,23 +210,29 @@ def build_xy(df: pd.DataFrame):
     for col in X.columns:
         X[col] = clean_numeric_series(X[col])
 
-    # remove impossible years if present
     if "YEARBUILT" in X.columns:
         X.loc[(X["YEARBUILT"] < 1800) | (X["YEARBUILT"] > 2100), "YEARBUILT"] = pd.NA
 
     X = X.dropna(axis=1, how="all")
-    X = X.fillna(X.median(numeric_only=True))
+    if X.shape[1] == 0:
+        raise ValueError("No usable predictor columns remain after cleaning.")
+
+    feature_defaults = X.median(numeric_only=True).to_dict()
+    X = X.fillna(pd.Series(feature_defaults))
+
+    X = X.replace([float("inf"), float("-inf")], pd.NA)
+    X = X.fillna(pd.Series(feature_defaults))
 
     X, y = X.align(y, join="inner", axis=0)
 
     if len(X) < 50:
         raise ValueError(f"Not enough usable rows for training: {len(X)}")
 
-    return X.astype(float), y.astype(float), list(X.columns)
+    return X.astype(float), y.astype(float), list(X.columns), feature_defaults
 
 
 def train_model(X: pd.DataFrame, y: pd.Series):
-    """Train linear regression model."""
+    """Train linear regression model and report MAE and R²."""
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.20, random_state=42
     )
@@ -283,7 +288,6 @@ else:
 st.write("Rows after target cleaning:", len(df))
 st.write("Rows used for modeling:", len(df_use))
 
-# Helpful diagnostics during development
 with st.expander("Filter diagnostics"):
     for col in ["PROP_TYPE_CODE", "PROP_TYPE_CODE_DESC", "LAND_USE_CODE", "LAND_USE_CODE_DESC"]:
         if col in df.columns:
@@ -298,7 +302,7 @@ if len(df_use) == 0:
 # Train model
 # -------------------------------
 try:
-    X, y, feature_names = build_xy(df_use)
+    X, y, feature_names, feature_defaults = build_xy(df_use)
     model, mae, r2 = train_model(X, y)
 except Exception as e:
     st.error(f"Training failed: {e}")
@@ -312,6 +316,9 @@ col2.metric("R²", f"{r2:.3f}")
 st.subheader("Features used")
 st.write(feature_names)
 
+with st.expander("Training feature medians"):
+    st.write(feature_defaults)
+
 # -------------------------------
 # Prediction UI
 # -------------------------------
@@ -322,12 +329,36 @@ user_input = {}
 ui_cols = st.columns(2)
 
 for i, col in enumerate(feature_names):
-    default_val = float(pd.to_numeric(df_use[col], errors="coerce").median())
-    with ui_cols[i % 2]:
-        user_input[col] = st.number_input(col, value=default_val)
+    default_val = feature_defaults.get(col, 0.0)
+    if pd.isna(default_val):
+        default_val = 0.0
 
-X_user = pd.DataFrame([user_input])[feature_names].astype(float)
-prediction = float(model.predict(X_user)[0])
+    with ui_cols[i % 2]:
+        user_input[col] = st.number_input(
+            col,
+            value=float(default_val),
+            step=1.0 if col in ["YEARBUILT", "FULLBATH", "THREEQUARTERBATH", "HALFBATH"] else 0.1,
+        )
+
+X_user = pd.DataFrame([user_input], columns=feature_names)
+
+for col in X_user.columns:
+    X_user[col] = pd.to_numeric(X_user[col], errors="coerce")
+
+X_user = X_user.replace([float("inf"), float("-inf")], pd.NA)
+X_user = X_user.fillna(pd.Series(feature_defaults))
+X_user = X_user.astype(float)
+
+with st.expander("Prediction input debug"):
+    st.write(X_user)
+    st.write("Missing values by column:")
+    st.write(X_user.isna().sum())
+
+try:
+    prediction = float(model.predict(X_user)[0])
+except Exception as e:
+    st.error(f"Prediction failed: {e}")
+    st.stop()
 
 st.write("### Predicted APPRAISED_VALUE")
 st.write(f"**${prediction:,.0f}**")
