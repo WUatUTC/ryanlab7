@@ -41,26 +41,45 @@ def find_data_file():
         st.error(f"Failed to download data: {e}")
         return None, None
 
-def unzip_and_pick_csv(zip_path: str, extract_dir: str = "data_assessor") -> str:
+def unzip_all(zip_path: str, extract_dir: str = "data_assessor") -> list[str]:
     os.makedirs(extract_dir, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(extract_dir)
     csv_files = []
     for root, _, files in os.walk(extract_dir):
         for f in files:
-            if f.lower().endswith(".csv"):
+            if f.lower().endswith(".csv") or f.lower().endswith(".txt"):
                 csv_files.append(os.path.join(root, f))
     if not csv_files:
-        raise FileNotFoundError("No CSV files found inside the ZIP after extraction.")
-    # pick largest CSV (typically the main export)
-    return max(csv_files, key=lambda p: os.path.getsize(p))
+        raise FileNotFoundError("No CSV/TXT files found inside the ZIP after extraction.")
+    return csv_files
 
 @st.cache_data(show_spinner=True)
 def load_df(zip_path: str | None, csv_path: str | None) -> pd.DataFrame:
     if zip_path:
-        csv_extracted = unzip_and_pick_csv(zip_path)
-        df = pd.read_csv(csv_extracted, low_memory=False)
-        df.attrs["source"] = f"ZIP → {csv_extracted}"
+        extracted_files = unzip_all(zip_path)
+        # Find main parcel file (largest or by name)
+        main_file = max(extracted_files, key=lambda p: os.path.getsize(p))
+        df_main = pd.read_csv(main_file, low_memory=False)
+        st.caption(f"Loaded main file: {main_file}")
+        
+        # Find building file (by name or assume second largest)
+        building_file = next((f for f in extracted_files if "building" in f.lower()), None)
+        if building_file:
+            df_building = pd.read_csv(building_file, low_memory=False)
+            st.caption(f"Loaded building file: {building_file}")
+            # Merge on MAP, GROUP, PARCEL (assume common columns)
+            merge_cols = ['MAP', 'GROUP', 'PARCEL']
+            if all(c in df_main.columns and c in df_building.columns for c in merge_cols):
+                df = pd.merge(df_main, df_building, on=merge_cols, how='left')
+            else:
+                st.warning("Could not merge building data: missing merge columns.")
+                df = df_main
+        else:
+            st.warning("No building file found; using main file only.")
+            df = df_main
+        
+        df.attrs["source"] = f"ZIP → {main_file} (and building if available)"
         return df
     if csv_path:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -84,7 +103,7 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def safe_residential_filter(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    type_cols = ["PROPERTY_CLASS", "CURRENT_USE_CODE_DESC", "CURRENT_USE_CODE"]
+    type_cols = ["PROP_TYPE_CODE_DESC", "CURRENT_USE_CODE_DESC", "LAND_USE_CODE_DESC"]
     res_col = next((c for c in type_cols if c in df.columns), None)
     if res_col is None:
         return df
@@ -95,8 +114,8 @@ def safe_residential_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     y = df["APPRAISED_VALUE"].copy()
-    # Define a few key features for simple model
-    possible_features = ["YEAR_BUILT", "BEDROOMS", "FULL_BATH", "HALF_BATH", "TOTAL_LIVING_AREA", "LOT_SIZE", "ACRES"]
+    # Define a few key features based on actual column names
+    possible_features = ["YearBuilt", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"]
     selected_features = [c for c in possible_features if c in df.columns]
     if not selected_features:
         raise ValueError("None of the selected key features are available in the dataset.")
@@ -107,7 +126,7 @@ def build_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     for col in X_raw.columns:
         X_raw[col] = pd.to_numeric(X_raw[col], errors="coerce")
     
-    X = pd.get_dummies(X_raw, drop_first=True)  # In case any categoricals sneak in, but unlikely
+    X = pd.get_dummies(X_raw, drop_first=True)  # In case any categoricals, but unlikely
     X = X.select_dtypes(include=[np.number, "bool"]).astype(float)
     X = X.dropna(axis=1, how="all")
     if X.shape[1] == 0:
@@ -175,7 +194,7 @@ st.metric("R²", f"{r2:.3f}")
 # ---------- Predict ----------
 st.subheader("Predict APPRAISED_VALUE")
 # The few features are the ones used in the model, so allow overrides for all available
-preferred_inputs = [c for c in ["YEAR_BUILT", "BEDROOMS", "FULL_BATH", "HALF_BATH", "TOTAL_LIVING_AREA", "LOT_SIZE", "ACRES"] if c in df_use.columns]
+preferred_inputs = [c for c in ["YearBuilt", "FullBath", "ThreeQuarterBath", "HalfBath", "SizeArea", "CALC_ACRES"] if c in df_use.columns]
 if preferred_inputs:
     st.caption("Enter values for the key features to predict the appraised value.")
     cols = st.columns(2)
