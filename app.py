@@ -9,9 +9,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 import requests  # Added for downloading data from URL
 
-st.set_page_config(page_title="Lab 7 - Property Value Predictor", layout="wide")
-st.title("Lab 7: Property Value Predictor (Linear Regression)")
-st.write("Loads assessor export (ZIP/CSV), trains Linear Regression, predicts APPRAISED_VALUE.")
+st.set_page_config(page_title="Property Value Predictor", layout="wide")
+st.title("Property Value Predictor (Linear Regression)")
+st.write("Loads Hamilton County assessor data, trains a simple Linear Regression model on a few key features, and predicts APPRAISED_VALUE.")
 
 def list_files_here():
     return sorted([p.name for p in Path(".").iterdir() if p.is_file()])
@@ -95,13 +95,23 @@ def safe_residential_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     y = df["APPRAISED_VALUE"].copy()
-    drop_cols = [c for c in ["APPRAISED_VALUE", "OWNER_NAME_1", "OWNER_NAME_2", "OWNER_NAME_3", "GISLINK"] if c in df.columns]
-    X_raw = df.drop(columns=drop_cols, errors="ignore")
-    X = pd.get_dummies(X_raw, drop_first=True)
+    # Define a few key features for simple model
+    possible_features = ["YEAR_BUILT", "BEDROOMS", "FULL_BATH", "HALF_BATH", "TOTAL_LIVING_AREA", "LOT_SIZE", "ACRES"]
+    selected_features = [c for c in possible_features if c in df.columns]
+    if not selected_features:
+        raise ValueError("None of the selected key features are available in the dataset.")
+    st.caption(f"Using these few features for modeling: {', '.join(selected_features)}")
+    
+    X_raw = df[selected_features].copy()
+    # Convert to numeric where possible
+    for col in X_raw.columns:
+        X_raw[col] = pd.to_numeric(X_raw[col], errors="coerce")
+    
+    X = pd.get_dummies(X_raw, drop_first=True)  # In case any categoricals sneak in, but unlikely
     X = X.select_dtypes(include=[np.number, "bool"]).astype(float)
     X = X.dropna(axis=1, how="all")
     if X.shape[1] == 0:
-        raise ValueError("No usable predictor columns after encoding (X has 0 columns).")
+        raise ValueError("No usable predictor columns after processing (X has 0 columns).")
     X = X.fillna(X.median(numeric_only=True))
     X, y = X.align(y, join="inner", axis=0)
     if X.shape[0] < 50:
@@ -158,33 +168,27 @@ except Exception as e:
     st.error(f"Training failed: {e}")
     st.stop()
 
-st.success("Model trained.")
+st.success("Model trained on selected features.")
 st.metric("MAE", f"${mae:,.0f}")
 st.metric("R²", f"{r2:.3f}")
 
 # ---------- Predict ----------
 st.subheader("Predict APPRAISED_VALUE")
-# Use median feature vector by default (always valid)
-X_user = pd.DataFrame([X.median(numeric_only=True)]).reindex(columns=feature_names, fill_value=0).astype(float)
-# Optional: let user override a few common numeric inputs if present in raw df
+# The few features are the ones used in the model, so allow overrides for all available
 preferred_inputs = [c for c in ["YEAR_BUILT", "BEDROOMS", "FULL_BATH", "HALF_BATH", "TOTAL_LIVING_AREA", "LOT_SIZE", "ACRES"] if c in df_use.columns]
 if preferred_inputs:
-    st.caption("Optional: override a few common fields (if present in your dataset).")
+    st.caption("Enter values for the key features to predict the appraised value.")
     cols = st.columns(2)
     user_raw = {}
     for i, col in enumerate(preferred_inputs):
         default_val = float(pd.to_numeric(df_use[col], errors="coerce").median())
         with cols[i % 2]:
             user_raw[col] = st.number_input(col, value=default_val)
-    # Convert to dummy-encoded feature space
-    raw_user_df = pd.DataFrame([user_raw])
-    raw_user_enc = pd.get_dummies(raw_user_df, drop_first=True)
-    raw_user_enc = raw_user_enc.reindex(columns=feature_names, fill_value=0).astype(float)
-    # Start from medians; overwrite provided inputs
-    X_user = pd.DataFrame([X.median(numeric_only=True)]).reindex(columns=feature_names, fill_value=0).astype(float)
-    for c in raw_user_enc.columns:
-        if c in X_user.columns:
-            X_user.loc[0, c] = raw_user_enc.loc[0, c]
+    # Since model uses these exact columns (numeric), create X_user directly
+    X_user = pd.DataFrame([user_raw]).reindex(columns=feature_names, fill_value=0).astype(float)
+else:
+    st.error("No input features available for prediction.")
+    st.stop()
 
 pred = float(model.predict(X_user)[0])
 st.write("### Predicted APPRAISED_VALUE")
