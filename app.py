@@ -18,7 +18,7 @@ st.set_page_config(page_title="Hamilton County Properties Predictor", layout="ce
 @st.cache_data(show_spinner=False)
 def load_data():
     # 👉 PASTE YOUR URL TO THE .ZIP FILE HERE 👈
-    data_url = "https://your-url-here.com/your_file.zip"
+    data_url = "https://www.hamiltontn.gov/_downloadsAssessor/AssessorExportCSV.zip"
     
     try:
         # Download the ZIP file from the URL
